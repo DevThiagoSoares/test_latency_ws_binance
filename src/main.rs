@@ -4,196 +4,33 @@
 //! e mede a latência entre o momento que o trade aconteceu e quando foi recebido.
 //!
 //! OTIMIZAÇÕES DE PERFORMANCE:
-//! - I/O movido para thread separada (fora do hot path)
-//! - Sem cálculo de estatísticas durante coleta (apenas no final, após JOIN)
+//! - Thread separada para I/O com CPU affinity (core dedicado)
+//! - Coleta no core 0, salvamento no core 1 (quando disponível)
+//! - Buffer pré-alocado para evitar realocações
+//! - Sem cálculo de estatísticas durante coleta (apenas contador)
 //! - Hot path mínimo: receber → extrair → calcular → enviar para channel
 //!
 //! Uso:
 //!   MACHINE_ID=m8a.xlarge ./target/release/binance-trades
 //!   CSV_FILE=latency.csv MACHINE_ID=m8a.xlarge MIN_TRADES=100000 ./target/release/binance-trades
 
+mod cpu_affinity;
+mod csv_buffer;
+mod csv_writer;
+mod extract;
+mod types;
+
+use cpu_affinity::{get_num_cores, set_cpu_affinity, set_thread_priority};
+use csv_buffer::CsvBuffer;
+use csv_writer::csv_writer_thread;
+use extract::extract_trade_data;
 use futures_util::StreamExt;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::SystemTime;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-// ============================================================================
-// Estrutura de Dados Brutos
-// ============================================================================
-
-/// Dados brutos de um trade para salvar no CSV.
-/// 
-/// Esta estrutura é enviada para a thread de I/O via channel,
-/// mantendo o hot path livre de operações de I/O.
-#[derive(Debug, Clone)]
-struct TradeRecord {
-    trade_id: u64,
-    ts: u64,           // Timestamp do trade (da Binance)
-    recv_ts: u64,      // Timestamp de recebimento
-    latency_ms: f64,   // Latência calculada
-    machine_id: String,
-}
-
-// ============================================================================
-// Extração de Dados do JSON (Hot Path)
-// ============================================================================
-
-/// Extrai trade_id e timestamp do JSON sem fazer parsing completo.
-///
-/// Esta função é otimizada para performance: em vez de deserializar o JSON completo
-/// (que seria lento), ela busca diretamente os campos "t" (trade_id) e "T" (timestamp)
-/// fazendo busca de string em bytes.
-///
-/// # Argumentos
-/// * `text` - String JSON da mensagem do WebSocket
-///
-/// # Retorno
-/// `Some((trade_id, timestamp))` se ambos campos foram encontrados, `None` caso contrário
-fn extract_trade_data(text: &str) -> Option<(u64, u64)> {
-    let bytes = text.as_bytes();
-    let mut trade_id = None;
-    let mut trade_time = None;
-    
-    // Busca o campo "t":<número> (trade_id)
-    for i in 0..bytes.len().saturating_sub(20) {
-        if bytes.get(i..i+4)? == b"\"t\":" {
-            let mut j = i + 4;
-            // Pula espaços após ":"
-            while j < bytes.len() && bytes[j] == b' ' {
-                j += 1;
-            }
-            
-            // Lê o número
-            let mut num = 0u64;
-            let start = j;
-            
-            while j < bytes.len() {
-                match bytes[j] {
-                    b @ b'0'..=b'9' => {
-                        num = num * 10 + (b - b'0') as u64;
-                        j += 1;
-                    }
-                    b',' | b'}' => break, // Fim do número
-                    _ => break,
-                }
-            }
-            
-            if j > start && num > 0 {
-                trade_id = Some(num);
-                break;
-            }
-        }
-    }
-    
-    // Busca o campo "T":<número> (timestamp)
-    for i in 0..bytes.len().saturating_sub(20) {
-        if bytes.get(i..i+4)? == b"\"T\":" {
-            let mut j = i + 4;
-            // Pula espaços após ":"
-            while j < bytes.len() && bytes[j] == b' ' {
-                j += 1;
-            }
-            
-            // Lê o número
-            let mut num = 0u64;
-            let start = j;
-            
-            while j < bytes.len() {
-                match bytes[j] {
-                    b @ b'0'..=b'9' => {
-                        num = num * 10 + (b - b'0') as u64;
-                        j += 1;
-                    }
-                    b',' | b'}' => break, // Fim do número
-                    _ => break,
-                }
-            }
-            
-            // Valida que é um timestamp válido (deve ser > 1000000000000 = ano 2001)
-            if j > start && num > 1000000000000 {
-                trade_time = Some(num);
-                break;
-            }
-        }
-    }
-    
-    // Retorna ambos se encontrados
-    if let (Some(id), Some(ts)) = (trade_id, trade_time) {
-        Some((id, ts))
-    } else {
-        None
-    }
-}
-
-// ============================================================================
-// Thread de I/O (Fora do Hot Path)
-// ============================================================================
-
-/// Thread dedicada para escrever dados no CSV.
-///
-/// Esta thread roda separadamente do hot path, evitando que operações de I/O
-/// (que podem ter locks internos do runtime/stdio) adicionem latência à medição.
-///
-/// Usa buffer interno e flush periódico para balancear performance e segurança.
-fn csv_writer_thread(
-    csv_file: String,
-    _machine_id: String,
-    rx: mpsc::Receiver<TradeRecord>,
-) {
-    use std::fs::OpenOptions;
-    
-    // Abre arquivo CSV
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&csv_file)
-        .expect(&format!("Erro ao criar CSV: {}", csv_file));
-    
-    // Escreve cabeçalho
-    writeln!(file, "trade_id,ts,recv_ts,latency_ms,machine_id").unwrap();
-    
-    let mut count = 0u64;
-    let mut buffer = Vec::with_capacity(8192); // Buffer de 8KB
-    
-    // Loop: recebe dados do channel e escreve no arquivo
-    while let Ok(record) = rx.recv() {
-        // Formata linha CSV
-        let line = format!("{},{},{},{:.2},{}\n", 
-            record.trade_id, 
-            record.ts, 
-            record.recv_ts, 
-            record.latency_ms, 
-            record.machine_id
-        );
-        
-        // Adiciona ao buffer
-        buffer.extend_from_slice(line.as_bytes());
-        
-        count += 1;
-        
-        // Flush periódico: a cada 1000 trades ou se buffer > 8KB
-        if count % 1000 == 0 || buffer.len() >= 8192 {
-            file.write_all(&buffer).unwrap();
-            file.flush().unwrap();
-            buffer.clear();
-        }
-    }
-    
-    // Flush final do buffer restante
-    if !buffer.is_empty() {
-        file.write_all(&buffer).unwrap();
-        file.flush().unwrap();
-    }
-    
-    eprintln!("CSV writer finalizado: {} trades salvos em {}", count, csv_file);
-}
-
-// ============================================================================
-// Função Principal
-// ============================================================================
+use types::TradeRecord;
 
 #[tokio::main]
 async fn main() {
@@ -212,26 +49,65 @@ async fn main() {
     let show_realtime = std::env::var("REALTIME").unwrap_or_else(|_| "1".to_string()) == "1";
     
     // ========================================================================
-    // Setup de I/O em Thread Separada (se CSV habilitado)
+    // Detecta número de cores e escolhe estratégia
     // ========================================================================
     
-    let (csv_tx, csv_rx) = if csv_file.is_some() {
+    let num_cores = get_num_cores();
+    eprintln!("Cores disponíveis: {}", num_cores);
+    
+    // ========================================================================
+    // Define CPU Affinity para Thread Principal (Core 0)
+    // ========================================================================
+    
+    // Tenta definir core 0 para coleta (thread principal)
+    if set_cpu_affinity(0) {
+        eprintln!("Thread principal: CPU affinity definida para core 0");
+    }
+    
+    // Define prioridade alta para coleta
+    if set_thread_priority(-10) {
+        eprintln!("Thread principal: Prioridade alta definida (-10)");
+    }
+    
+    // ========================================================================
+    // Setup de I/O: Thread Separada (2+ cores) ou Buffer Pré-alocado (1 core)
+    // ========================================================================
+    
+    // Para 2+ cores: usa thread separada com CPU affinity
+    // Para 1 core: usa buffer pré-alocado (evita time-slicing)
+    let (csv_tx, csv_rx) = if csv_file.is_some() && num_cores >= 2 {
         let (tx, rx) = mpsc::channel();
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
     
-    // Spawn thread de I/O (fora do hot path)
+    let csv_buffer: Option<std::sync::Arc<CsvBuffer>> = if csv_file.is_some() && num_cores == 1 {
+        match CsvBuffer::new(csv_file.as_ref().unwrap()) {
+            Ok(buffer) => {
+                eprintln!("Usando buffer pré-alocado (1 core detectado - evita time-slicing)");
+                Some(std::sync::Arc::new(buffer))
+            },
+            Err(e) => {
+                eprintln!("Erro ao criar CSV: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    
+    // Spawn thread de I/O com CPU affinity (core 1) - apenas se 2+ cores
     if let (Some(file), Some(rx)) = (csv_file.clone(), csv_rx) {
         let machine_id_io = machine_id.clone();
+        eprintln!("Usando thread separada para I/O (2+ cores detectados)");
         std::thread::spawn(move || {
             csv_writer_thread(file, machine_id_io, rx);
         });
     }
     
     // ========================================================================
-    // Contador Simples (apenas para display, sem estatísticas complexas)
+    // Contador Simples (apenas para display)
     // ========================================================================
     
     let count = std::sync::Arc::new(AtomicU64::new(0));
@@ -280,8 +156,9 @@ async fn main() {
     //
     // Este é o caminho crítico de performance. Qualquer operação aqui
     // adiciona latência à medição. Por isso:
-    // - Sem I/O (movido para thread separada)
+    // - Thread separada para I/O (core 1, prioridade menor)
     // - Sem estatísticas complexas (apenas contador atômico)
+    // - Channel unbounded (muito rápido, apenas push em queue)
     // - Apenas: receber → extrair → calcular → enviar para channel
     
     while let Some(msg) = read.next().await {
@@ -299,11 +176,23 @@ async fn main() {
                 let latency_ms = recv_ts as f64 - ts as f64;
                 
                 // PASSO 4: Atualiza contador (lock-free, muito rápido)
-                count.fetch_add(1, Ordering::Relaxed);
+                let current_count = count.fetch_add(1, Ordering::Relaxed) + 1;
                 
-                // PASSO 5: Envia para thread de I/O (se habilitado)
-                // Channel unbounded é muito rápido (apenas push em queue)
-                if let Some(ref tx) = csv_tx {
+                // PASSO 5: Salva no CSV (estratégia depende do número de cores)
+                // 1 core: escreve direto no buffer pré-alocado (evita time-slicing)
+                // 2+ cores: envia para thread separada via channel
+                if let Some(ref buffer) = csv_buffer {
+                    // 1 core: buffer pré-alocado
+                    buffer.write_line(trade_id, ts, recv_ts, latency_ms, &machine_id);
+                    
+                    // Flush periódico: a cada 1000 trades
+                    if current_count % 1000 == 0 {
+                        if let Err(e) = buffer.flush() {
+                            eprintln!("Erro ao fazer flush: {}", e);
+                        }
+                    }
+                } else if let Some(ref tx) = csv_tx {
+                    // 2+ cores: thread separada
                     let record = TradeRecord {
                         trade_id,
                         ts,
@@ -316,18 +205,15 @@ async fn main() {
                 }
                 
                 // PASSO 6: Verifica se atingiu o número mínimo de trades
-                if min_trades > 0 {
-                    let c = count.load(Ordering::Relaxed);
-                    if c >= min_trades {
-                        if show_realtime {
-                            print!("\n\n");
-                        }
-                        eprintln!("Coleta concluída: {} trades", c);
-                        if let Some(ref file) = csv_file {
-                            eprintln!("Dados salvos em: {}", file);
-                        }
-                        break; // Para o loop
+                if min_trades > 0 && current_count >= min_trades {
+                    if show_realtime {
+                        print!("\n\n");
                     }
+                    eprintln!("Coleta concluída: {} trades", current_count);
+                    if let Some(ref file) = csv_file {
+                        eprintln!("Dados salvos em: {}", file);
+                    }
+                    break; // Para o loop
                 }
             }
         }
@@ -346,14 +232,22 @@ async fn main() {
     eprintln!("Machine ID: {}", machine_id);
     eprintln!("Total de trades coletados: {}", total);
     
+    // Finaliza I/O dependendo da estratégia usada
+    if csv_buffer.is_some() {
+        // 1 core: flush final do buffer
+        if let Some(ref buffer) = csv_buffer {
+            if let Err(e) = buffer.finalize() {
+                eprintln!("Erro ao finalizar CSV: {}", e);
+            }
+        }
+    } else if csv_tx.is_some() {
+        // 2+ cores: fecha channel e aguarda thread finalizar
+        drop(csv_tx);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    
     if let Some(ref file) = csv_file {
         eprintln!("Dados salvos em: {}", file);
         eprintln!("\n💡 Próximo passo: Faça JOIN dos CSVs por trade_id para análise estatística");
     }
-    
-    // Fecha channel para finalizar thread de I/O
-    drop(csv_tx);
-    
-    // Aguarda um pouco para thread de I/O finalizar
-    std::thread::sleep(std::time::Duration::from_millis(100));
 }
