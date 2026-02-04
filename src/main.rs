@@ -3,212 +3,41 @@
 //! Este programa conecta ao WebSocket da Binance, recebe trades de BTC/USDT em tempo real,
 //! e mede a latência entre o momento que o trade aconteceu e quando foi recebido.
 //!
+//! OTIMIZAÇÕES DE PERFORMANCE:
+//! - I/O movido para thread separada (fora do hot path)
+//! - Sem cálculo de estatísticas durante coleta (apenas no final, após JOIN)
+//! - Hot path mínimo: receber → extrair → calcular → enviar para channel
+//!
 //! Uso:
 //!   MACHINE_ID=m8a.xlarge ./target/release/binance-trades
 //!   CSV_FILE=latency.csv MACHINE_ID=m8a.xlarge MIN_TRADES=100000 ./target/release/binance-trades
 
 use futures_util::StreamExt;
-use std::collections::VecDeque;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::SystemTime;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 // ============================================================================
-// Estrutura de Estatísticas
+// Estrutura de Dados Brutos
 // ============================================================================
 
-/// Armazena estatísticas de latência e validações de integridade dos trades.
-///
-/// Usa operações atômicas (lock-free) para atualizações rápidas e thread-safe.
-/// Mantém uma amostra recente de latências para cálculo de percentis e jitter.
-struct LatencyStats {
-    /// Contador total de trades processados
-    count: AtomicU64,
-    
-    /// Soma total de latências em microsegundos (para cálculo da média)
-    total_latency: AtomicU64,
-    
-    /// Latência mínima observada (em microsegundos)
-    min: AtomicU64,
-    
-    /// Latência máxima observada (em microsegundos)
-    max: AtomicU64,
-    
-    /// Amostra recente de latências para cálculo de percentis e jitter
-    /// Mantém apenas as últimas N amostras (configurável)
-    recent_latencies: Mutex<VecDeque<f64>>,
-    
-    /// Tamanho máximo da amostra recente
-    max_samples: usize,
-    
-    /// ID do último trade processado (para detectar gaps e ordem)
-    last_trade_id: AtomicU64,
-    
-    /// Número de trades perdidos (gaps) detectados
-    gaps_detected: AtomicU64,
-    
-    /// Número de trades recebidos fora de ordem
-    out_of_order: AtomicU64,
-    
-    /// Timestamp de início da coleta (para cálculo de throughput)
-    start_time: SystemTime,
-}
-
-impl LatencyStats {
-    /// Cria uma nova estrutura de estatísticas.
-    ///
-    /// # Argumentos
-    /// * `max_samples` - Tamanho máximo da amostra para cálculo de percentis
-    fn new(max_samples: usize) -> Self {
-        Self {
-            count: AtomicU64::new(0),
-            total_latency: AtomicU64::new(0),
-            min: AtomicU64::new(u64::MAX),
-            max: AtomicU64::new(0),
-            recent_latencies: Mutex::new(VecDeque::with_capacity(max_samples)),
-            max_samples,
-            last_trade_id: AtomicU64::new(0),
-            gaps_detected: AtomicU64::new(0),
-            out_of_order: AtomicU64::new(0),
-            start_time: SystemTime::now(),
-        }
-    }
-
-    /// Atualiza as estatísticas com um novo trade.
-    ///
-    /// # Argumentos
-    /// * `trade_id` - ID único do trade (para validação de ordem e gaps)
-    /// * `latency_ms` - Latência do trade em milissegundos
-    ///
-    /// # Funcionalidades
-    /// - Atualiza contador e soma de latências (lock-free)
-    /// - Atualiza min/max usando compare-and-swap (lock-free)
-    /// - Detecta trades perdidos (gaps) comparando trade_ids consecutivos
-    /// - Detecta trades fora de ordem
-    /// - Mantém amostra recente para cálculo de percentis
-    fn update(&self, trade_id: u64, latency_ms: f64) {
-        // Converte latência para microsegundos para precisão
-        let latency_us = (latency_ms * 1000.0) as u64;
-        
-        // Atualiza contador e soma (lock-free)
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.total_latency.fetch_add(latency_us, Ordering::Relaxed);
-        
-        // Atualiza mínimo usando compare-and-swap (lock-free)
-        loop {
-            let current = self.min.load(Ordering::Relaxed);
-            if latency_us >= current {
-                break; // Não é menor que o atual
-            }
-            // Tenta atualizar apenas se o valor ainda for o mesmo
-            if self.min.compare_exchange(current, latency_us, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                break; // Atualizado com sucesso
-            }
-            // Se falhou, tenta novamente (outro thread pode ter atualizado)
-        }
-        
-        // Atualiza máximo usando compare-and-swap (lock-free)
-        loop {
-            let current = self.max.load(Ordering::Relaxed);
-            if latency_us <= current {
-                break; // Não é maior que o atual
-            }
-            if self.max.compare_exchange(current, latency_us, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                break; // Atualizado com sucesso
-            }
-        }
-
-        // Validação de ordem e detecção de gaps
-        let last_id = self.last_trade_id.load(Ordering::Relaxed);
-        if last_id > 0 {
-            if trade_id < last_id {
-                // Trade recebido fora de ordem (trade_id menor que o anterior)
-                self.out_of_order.fetch_add(1, Ordering::Relaxed);
-            } else if trade_id > last_id + 1 {
-                // Gap detectado: pulou um ou mais trade_ids (trades perdidos)
-                let gap = trade_id - last_id - 1;
-                self.gaps_detected.fetch_add(gap, Ordering::Relaxed);
-            }
-        }
-        self.last_trade_id.store(trade_id, Ordering::Relaxed);
-
-        // Mantém amostra recente para cálculo de percentis e jitter
-        let mut latencies = self.recent_latencies.lock().unwrap();
-        latencies.push_back(latency_ms);
-        // Remove amostras antigas se exceder o limite
-        if latencies.len() > self.max_samples {
-            latencies.pop_front();
-        }
-    }
-
-    /// Retorna todas as estatísticas calculadas.
-    ///
-    /// # Retorno
-    /// Tupla com: (count, avg, min, max, p50, p95, p99, jitter, gaps, out_of_order, throughput)
-    /// - count: Total de trades
-    /// - avg: Latência média em ms
-    /// - min: Latência mínima em ms
-    /// - max: Latência máxima em ms
-    /// - p50: Percentil 50 (mediana) em ms
-    /// - p95: Percentil 95 em ms
-    /// - p99: Percentil 99 em ms
-    /// - jitter: Desvio padrão (variação) em ms
-    /// - gaps: Número de trades perdidos
-    /// - out_of_order: Número de trades fora de ordem
-    /// - throughput: Trades por segundo
-    fn get(&self) -> (u64, f64, f64, f64, f64, f64, f64, f64, u64, u64, f64) {
-        let count = self.count.load(Ordering::Relaxed);
-        if count == 0 {
-            return (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0.0);
-        }
-        
-        // Calcula média, min e max
-        let total = self.total_latency.load(Ordering::Relaxed) as f64 / 1000.0;
-        let avg = total / count as f64;
-        let min = self.min.load(Ordering::Relaxed) as f64 / 1000.0;
-        let max = self.max.load(Ordering::Relaxed) as f64 / 1000.0;
-
-        // Calcula percentis e jitter da amostra recente
-        let latencies = self.recent_latencies.lock().unwrap();
-        let mut sorted: Vec<f64> = latencies.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        
-        let (p50, p95, p99, jitter) = if sorted.is_empty() {
-            (0.0, 0.0, 0.0, 0.0)
-        } else {
-            // Calcula índices para percentis
-            let p50_idx = (sorted.len() as f64 * 0.50) as usize;
-            let p95_idx = (sorted.len() as f64 * 0.95) as usize;
-            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
-            
-            let p50 = sorted[p50_idx];
-            let p95 = sorted[p95_idx];
-            let p99 = sorted[p99_idx];
-            
-            // Jitter = desvio padrão (mede variação de latência)
-            let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
-            let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / sorted.len() as f64;
-            let jitter = variance.sqrt();
-            
-            (p50, p95, p99, jitter)
-        };
-
-        // Calcula throughput (trades por segundo)
-        let elapsed = self.start_time.elapsed().unwrap().as_secs_f64();
-        let throughput = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
-
-        let gaps = self.gaps_detected.load(Ordering::Relaxed);
-        let out_of_order = self.out_of_order.load(Ordering::Relaxed);
-
-        (count, avg, min, max, p50, p95, p99, jitter, gaps, out_of_order, throughput)
-    }
+/// Dados brutos de um trade para salvar no CSV.
+/// 
+/// Esta estrutura é enviada para a thread de I/O via channel,
+/// mantendo o hot path livre de operações de I/O.
+#[derive(Debug, Clone)]
+struct TradeRecord {
+    trade_id: u64,
+    ts: u64,           // Timestamp do trade (da Binance)
+    recv_ts: u64,      // Timestamp de recebimento
+    latency_ms: f64,   // Latência calculada
+    machine_id: String,
 }
 
 // ============================================================================
-// Extração de Dados do JSON
+// Extração de Dados do JSON (Hot Path)
 // ============================================================================
 
 /// Extrai trade_id e timestamp do JSON sem fazer parsing completo.
@@ -222,13 +51,6 @@ impl LatencyStats {
 ///
 /// # Retorno
 /// `Some((trade_id, timestamp))` se ambos campos foram encontrados, `None` caso contrário
-///
-/// # Exemplo de JSON
-/// ```json
-/// {"e":"trade","E":1769693418944,"s":"BTCUSDT","t":5827967018,"p":"88120.26","q":"0.00008","T":1769693418802,"m":false}
-/// ```
-/// - Campo `t`: trade_id (5827967018)
-/// - Campo `T`: timestamp do trade em milissegundos (1769693418802)
 fn extract_trade_data(text: &str) -> Option<(u64, u64)> {
     let bytes = text.as_bytes();
     let mut trade_id = None;
@@ -306,6 +128,70 @@ fn extract_trade_data(text: &str) -> Option<(u64, u64)> {
 }
 
 // ============================================================================
+// Thread de I/O (Fora do Hot Path)
+// ============================================================================
+
+/// Thread dedicada para escrever dados no CSV.
+///
+/// Esta thread roda separadamente do hot path, evitando que operações de I/O
+/// (que podem ter locks internos do runtime/stdio) adicionem latência à medição.
+///
+/// Usa buffer interno e flush periódico para balancear performance e segurança.
+fn csv_writer_thread(
+    csv_file: String,
+    _machine_id: String,
+    rx: mpsc::Receiver<TradeRecord>,
+) {
+    use std::fs::OpenOptions;
+    
+    // Abre arquivo CSV
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&csv_file)
+        .expect(&format!("Erro ao criar CSV: {}", csv_file));
+    
+    // Escreve cabeçalho
+    writeln!(file, "trade_id,ts,recv_ts,latency_ms,machine_id").unwrap();
+    
+    let mut count = 0u64;
+    let mut buffer = Vec::with_capacity(8192); // Buffer de 8KB
+    
+    // Loop: recebe dados do channel e escreve no arquivo
+    while let Ok(record) = rx.recv() {
+        // Formata linha CSV
+        let line = format!("{},{},{},{:.2},{}\n", 
+            record.trade_id, 
+            record.ts, 
+            record.recv_ts, 
+            record.latency_ms, 
+            record.machine_id
+        );
+        
+        // Adiciona ao buffer
+        buffer.extend_from_slice(line.as_bytes());
+        
+        count += 1;
+        
+        // Flush periódico: a cada 1000 trades ou se buffer > 8KB
+        if count % 1000 == 0 || buffer.len() >= 8192 {
+            file.write_all(&buffer).unwrap();
+            file.flush().unwrap();
+            buffer.clear();
+        }
+    }
+    
+    // Flush final do buffer restante
+    if !buffer.is_empty() {
+        file.write_all(&buffer).unwrap();
+        file.flush().unwrap();
+    }
+    
+    eprintln!("CSV writer finalizado: {} trades salvos em {}", count, csv_file);
+}
+
+// ============================================================================
 // Função Principal
 // ============================================================================
 
@@ -324,58 +210,49 @@ async fn main() {
         .parse()
         .unwrap_or(0);
     let show_realtime = std::env::var("REALTIME").unwrap_or_else(|_| "1".to_string()) == "1";
-    let max_samples: usize = std::env::var("STATS_SAMPLES")
-        .unwrap_or_else(|_| "10000".to_string())
-        .parse()
-        .unwrap_or(10000);
-
+    
     // ========================================================================
-    // Inicialização de Estatísticas
+    // Setup de I/O em Thread Separada (se CSV habilitado)
     // ========================================================================
     
-    let stats = std::sync::Arc::new(LatencyStats::new(max_samples));
-    let stats_clone = stats.clone(); // Clone para a task de display
-
-    // ========================================================================
-    // Configuração de CSV (se habilitado)
-    // ========================================================================
-    
-    let mut csv_writer: Option<std::fs::File> = if let Some(ref file) = csv_file {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(file)
-            .expect(&format!("Erro ao criar CSV: {}", file));
-        // Escreve cabeçalho do CSV
-        writeln!(f, "trade_id,ts,recv_ts,latency_ms,machine_id").unwrap();
-        Some(f)
+    let (csv_tx, csv_rx) = if csv_file.is_some() {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
     } else {
-        None
+        (None, None)
     };
-
+    
+    // Spawn thread de I/O (fora do hot path)
+    if let (Some(file), Some(rx)) = (csv_file.clone(), csv_rx) {
+        let machine_id_io = machine_id.clone();
+        std::thread::spawn(move || {
+            csv_writer_thread(file, machine_id_io, rx);
+        });
+    }
+    
     // ========================================================================
-    // Task de Display em Tempo Real
+    // Contador Simples (apenas para display, sem estatísticas complexas)
     // ========================================================================
     
+    let count = std::sync::Arc::new(AtomicU64::new(0));
+    let count_display = count.clone();
     let machine_id_display = machine_id.clone();
+    
     if show_realtime {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let (count, avg, _min, _max, p50, p95, p99, jitter, gaps, out_of_order, throughput) = stats_clone.get();
-                if count > 0 {
-                    // Limpa linha anterior e mostra estatísticas atualizadas
+                let c = count_display.load(Ordering::Relaxed);
+                if c > 0 {
                     print!("\r\x1b[K"); // ANSI: volta ao início da linha e limpa
-                    print!("[{}] Trades: {} | Lat: Avg={:.1}ms p50={:.1}ms p95={:.1}ms p99={:.1}ms | Jitter={:.1}ms | TPS={:.1} | Gaps={} OOO={}", 
-                        machine_id_display, count, avg, p50, p95, p99, jitter, throughput, gaps, out_of_order);
-                    io::stdout().flush().unwrap();
+                    print!("[{}] Trades coletados: {}", machine_id_display, c);
+                    let _ = std::io::stdout().flush();
                 }
             }
         });
     }
-
+    
     // ========================================================================
     // Conexão WebSocket
     // ========================================================================
@@ -383,23 +260,29 @@ async fn main() {
     let url = "wss://stream.binance.com:9443/ws/btcusdt@trade";
     eprintln!("Conectando a {}...", url);
     eprintln!("Machine ID: {}", machine_id);
+    if csv_file.is_some() {
+        eprintln!("CSV: {}", csv_file.as_ref().unwrap());
+    }
     if show_realtime {
-        eprintln!("Modo tempo real: ATIVADO (atualiza a cada 1s)\n");
+        eprintln!("Display tempo real: ATIVADO\n");
+    } else {
+        eprintln!("Display tempo real: DESATIVADO\n");
     }
 
     let (ws_stream, _) = connect_async(url).await.expect("Erro ao conectar");
-    if show_realtime {
-        eprintln!("\x1b[2J\x1b[H"); // Limpa tela
-        eprintln!("Conectado! Coletando dados em tempo real...\n");
-    } else {
-        eprintln!("Conectado! Coletando dados...\n");
-    }
+    eprintln!("Conectado! Coletando dados...\n");
 
     let (_write, mut read) = ws_stream.split();
 
     // ========================================================================
-    // Loop Principal: Processamento de Mensagens
+    // HOT PATH: Loop Principal (Mínimo possível)
     // ========================================================================
+    //
+    // Este é o caminho crítico de performance. Qualquer operação aqui
+    // adiciona latência à medição. Por isso:
+    // - Sem I/O (movido para thread separada)
+    // - Sem estatísticas complexas (apenas contador atômico)
+    // - Apenas: receber → extrair → calcular → enviar para channel
     
     while let Some(msg) = read.next().await {
         if let Ok(Message::Text(text)) = msg {
@@ -415,29 +298,31 @@ async fn main() {
                 // PASSO 3: Calcula latência = quando recebemos - quando trade aconteceu
                 let latency_ms = recv_ts as f64 - ts as f64;
                 
-                // PASSO 4: Atualiza estatísticas (lock-free, muito rápido)
-                // Inclui validações: ordem, gaps, percentis, jitter
-                stats.update(trade_id, latency_ms);
-
-                // PASSO 5: Salva no CSV se habilitado
-                if let Some(ref mut file) = csv_writer {
-                    writeln!(file, "{},{},{},{:.2},{}", trade_id, ts, recv_ts, latency_ms, machine_id).unwrap();
-                    
-                    // Flush periódico para garantir que dados não sejam perdidos
-                    let count = stats.count.load(Ordering::Relaxed);
-                    if count % 1000 == 0 {
-                        let _ = file.flush();
-                    }
+                // PASSO 4: Atualiza contador (lock-free, muito rápido)
+                count.fetch_add(1, Ordering::Relaxed);
+                
+                // PASSO 5: Envia para thread de I/O (se habilitado)
+                // Channel unbounded é muito rápido (apenas push em queue)
+                if let Some(ref tx) = csv_tx {
+                    let record = TradeRecord {
+                        trade_id,
+                        ts,
+                        recv_ts,
+                        latency_ms,
+                        machine_id: machine_id.clone(),
+                    };
+                    // Ignora erro se receiver foi fechado (thread finalizou)
+                    let _ = tx.send(record);
                 }
                 
                 // PASSO 6: Verifica se atingiu o número mínimo de trades
                 if min_trades > 0 {
-                    let count = stats.count.load(Ordering::Relaxed);
-                    if count >= min_trades {
+                    let c = count.load(Ordering::Relaxed);
+                    if c >= min_trades {
                         if show_realtime {
                             print!("\n\n");
                         }
-                        eprintln!("Coleta concluída: {} trades", count);
+                        eprintln!("Coleta concluída: {} trades", c);
                         if let Some(ref file) = csv_file {
                             eprintln!("Dados salvos em: {}", file);
                         }
@@ -449,27 +334,26 @@ async fn main() {
     }
     
     // ========================================================================
-    // Estatísticas Finais
+    // Finalização
     // ========================================================================
     
     if show_realtime {
         print!("\n\n");
     }
-    let (count, avg, min, max, p50, p95, p99, jitter, gaps, out_of_order, throughput) = stats.get();
-    eprintln!("\n=== Estatísticas Finais ===");
+    
+    let total = count.load(Ordering::Relaxed);
+    eprintln!("\n=== Coleta Finalizada ===");
     eprintln!("Machine ID: {}", machine_id);
-    eprintln!("Total de trades: {}", count);
-    eprintln!("\n--- Latência ---");
-    eprintln!("  Média: {:.2}ms", avg);
-    eprintln!("  Mediana (p50): {:.2}ms", p50);
-    eprintln!("  p95: {:.2}ms", p95);
-    eprintln!("  p99: {:.2}ms", p99);
-    eprintln!("  Mínima: {:.2}ms", min);
-    eprintln!("  Máxima: {:.2}ms", max);
-    eprintln!("  Jitter (std): {:.2}ms", jitter);
-    eprintln!("\n--- Validações ---");
-    eprintln!("  Trades perdidos (gaps): {}", gaps);
-    eprintln!("  Trades fora de ordem: {}", out_of_order);
-    eprintln!("\n--- Performance ---");
-    eprintln!("  Throughput: {:.2} trades/segundo", throughput);
+    eprintln!("Total de trades coletados: {}", total);
+    
+    if let Some(ref file) = csv_file {
+        eprintln!("Dados salvos em: {}", file);
+        eprintln!("\n💡 Próximo passo: Faça JOIN dos CSVs por trade_id para análise estatística");
+    }
+    
+    // Fecha channel para finalizar thread de I/O
+    drop(csv_tx);
+    
+    // Aguarda um pouco para thread de I/O finalizar
+    std::thread::sleep(std::time::Duration::from_millis(100));
 }

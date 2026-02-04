@@ -1,242 +1,192 @@
-# Teste de Latência - Binance Trades
+# Teste de Latência - Binance WebSocket
 
-Sistema para testar e comparar latência de trades da Binance em diferentes configurações de instâncias AWS.
+Sistema para medir latência de trades da Binance em diferentes configurações de servidor.
 
-## 🎯 Como o Teste Funciona
+## 🎯 Como Funciona
 
-### 1. Conexão WebSocket
-- Conecta ao stream de trades da Binance: `wss://stream.binance.com:9443/ws/btcusdt@trade`
-- Recebe trades de BTC/USDT em tempo real
+1. Conecta ao WebSocket da Binance: `wss://stream.binance.com:9443/ws/btcusdt@trade`
+2. Para cada trade recebido:
+   - Captura timestamp de recebimento (`recv_ts`)
+   - Extrai timestamp do trade (`ts`) do JSON
+   - Calcula latência: `latency_ms = recv_ts - ts`
+3. Salva dados brutos em CSV: `trade_id,ts,recv_ts,latency_ms,machine_id`
 
-### 2. Medição de Latência
-Para cada trade recebido:
-1. **Captura timestamp de recebimento** (`recv_ts`) - momento exato que a mensagem chega na máquina
-2. **Extrai timestamp do trade** (`ts`) - momento que o trade aconteceu (campo `T` do JSON)
-3. **Calcula latência**: `latency_ms = recv_ts - ts`
+**Otimizações:**
+- I/O em thread separada (fora do hot path)
+- Zero parsing JSON completo (apenas extrai campos necessários)
+- Hot path mínimo: receber → extrair → calcular → enviar
 
-### 3. Processamento
-- **Zero parsing JSON**: Apenas extrai os campos `t` (trade_id) e `T` (timestamp) por busca de string
-- **Estatísticas lock-free**: Usa atomics para atualização sem locks
-- **Display em tempo real**: Mostra estatísticas atualizadas a cada 1 segundo
+## 🚀 Como Usar
 
-### 4. Coleta de Dados
-- Salva em CSV: `trade_id,ts,recv_ts,latency_ms,machine_id`
-- Permite merge posterior por `trade_id` para comparar mesmos trades entre máquinas
+### Compilar
 
-## 🧪 Como Testar
-
-### Teste Rápido (30 segundos)
 ```bash
-# Teste rápido que coleta ~1000 trades
-./test_quick.sh
-```
-
-### Teste Manual (Tempo Real)
-```bash
-# 1. Compilar
 cargo build --release
-
-# 2. Executar em modo tempo real (sem salvar)
-MACHINE_ID=test-local ./target/release/binance-trades
-
-# Você verá estatísticas atualizando a cada 1 segundo:
-# [test-local] Trades: 1523 | Lat: Avg=142.3ms p50=140.1ms p95=180.5ms p99=220.0ms | Jitter=15.2ms | TPS=45.3 | Gaps=0 OOO=0
 ```
 
-### Teste Completo (100k trades)
+### Teste Local (Validação)
+
 ```bash
-# Coleta 100k trades e salva em CSV
+# Teste rápido: ~1000 trades
+CSV_FILE=test.csv MACHINE_ID=local MIN_TRADES=1000 ./target/release/binance-trades
+
+# Teste com display em tempo real
+MACHINE_ID=local REALTIME=1 ./target/release/binance-trades
+```
+
+### Teste Completo (Local ou AWS)
+
+```bash
+# Usando script (recomendado)
+./run_test.sh m8a.xlarge false 100000
+
+# Ou manualmente
+CSV_FILE=latency_m8a_$(date +%s).csv \
+MACHINE_ID=m8a.xlarge \
+MIN_TRADES=100000 \
+REALTIME=0 \
+./target/release/binance-trades
+```
+
+**Parâmetros do script:**
+- `m8a.xlarge`: Identificador da máquina (use o tipo da instância AWS ou nome customizado)
+- `false`: Não aplicar otimizações de rede (use `true` para aplicar)
+- `100000`: Número mínimo de trades
+
+### Executar em Múltiplas Instâncias (AWS)
+
+**Instância 1:**
+```bash
 ./run_test.sh m8a.xlarge false 100000
 ```
 
-## 🚀 Uso
+**Instância 2:**
+```bash
+./run_test.sh z1d.xlarge false 100000
+```
 
-### Compilar
+**Instância 3:**
+```bash
+./run_test.sh c8i.xlarge false 100000
+```
+
+**Importante:** Execute simultaneamente para comparar os mesmos trades.
+
+### Otimizações de Rede (AWS - Opcional)
+
+```bash
+# Aplicar otimizações antes do teste
+sudo ./optimize_network.sh
+
+# Depois execute o teste normalmente
+./run_test.sh m8a.xlarge false 100000
+```
+
+## 📊 Variáveis de Ambiente
+
+| Variável | Descrição | Padrão |
+|----------|-----------|--------|
+| `MACHINE_ID` | Identificador da máquina | `unknown` |
+| `CSV_FILE` | Arquivo CSV para salvar | (não salva) |
+| `MIN_TRADES` | Número mínimo de trades (0 = infinito) | `0` |
+| `REALTIME` | Mostrar contador em tempo real (`1` ou `0`) | `1` |
+
+## 📁 Formato do CSV
+
+```csv
+trade_id,ts,recv_ts,latency_ms,machine_id
+5827967018,1769693418802,1769693418944,142.00,m8a.xlarge
+5827967019,1769693418900,1769693419045,145.00,m8a.xlarge
+```
+
+- `trade_id`: ID único do trade (para JOIN entre máquinas)
+- `ts`: Timestamp do trade (da Binance)
+- `recv_ts`: Timestamp de recebimento na máquina
+- `latency_ms`: Latência calculada em milissegundos
+- `machine_id`: Identificador da máquina
+
+## 📈 Análise dos Resultados
+
+**Importante:** Calcule estatísticas **após fazer JOIN** dos CSVs por `trade_id`.
+
+### Exemplo com Python/Pandas
+
+```python
+import pandas as pd
+
+# Carregar CSVs
+df_m8a = pd.read_csv('latency_m8a_123456.csv')
+df_z1d = pd.read_csv('latency_z1d_123456.csv')
+
+# JOIN por trade_id
+df_joined = df_m8a.merge(
+    df_z1d[['trade_id', 'latency_ms']], 
+    on='trade_id', 
+    suffixes=('_m8a', '_z1d')
+)
+
+# Estatísticas
+print("M8A - Média:", df_joined['latency_ms_m8a'].mean())
+print("M8A - Mediana:", df_joined['latency_ms_m8a'].median())
+print("M8A - p95:", df_joined['latency_ms_m8a'].quantile(0.95))
+print("M8A - p99:", df_joined['latency_ms_m8a'].quantile(0.99))
+
+print("Z1D - Média:", df_joined['latency_ms_z1d'].mean())
+print("Z1D - Mediana:", df_joined['latency_ms_z1d'].median())
+```
+
+## 🛠️ Setup na AWS
+
+### 1. Instalar Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+### 2. Clonar Repositório
+
+```bash
+git clone https://github.com/DevThiagoSoares/test_latency_ws_binance.git
+cd test_latency_ws_binance
+```
+
+### 3. Compilar
+
 ```bash
 cargo build --release
 ```
 
-### Executar
+### 4. Executar Teste
 
-**Modo Tempo Real (recomendado):**
 ```bash
-# Apenas visualização
-MACHINE_ID=m8a.xlarge ./target/release/binance-trades
-
-# Com CSV (salva enquanto mostra)
-CSV_FILE=latency_m8a.csv MACHINE_ID=m8a.xlarge ./target/release/binance-trades
+./run_test.sh m8a.xlarge false 100000
 ```
 
-**Modo Coleta (sem display):**
+### 5. Baixar Resultados
+
 ```bash
-REALTIME=0 CSV_FILE=latency_m8a.csv MACHINE_ID=m8a.xlarge MIN_TRADES=100000 ./target/release/binance-trades
+# No seu computador local
+scp -i sua-chave.pem ec2-user@IP-INSTANCIA:~/test-infra/latency_*.csv ./
 ```
 
-### Exemplo de Saída (Tempo Real)
-```
-[m8a.xlarge] Trades: 1523 | Lat: Avg=142.3ms p50=140.1ms p95=180.5ms p99=220.0ms | Jitter=15.2ms | TPS=45.3 | Gaps=0 OOO=0
-```
-Esta linha atualiza a cada 1 segundo.
+## ⚠️ Troubleshooting
 
-**Legenda:**
-- `Lat`: Latência (Avg=média, p50=mediana, p95=p95, p99=p99)
-- `Jitter`: Desvio padrão (variação de latência)
-- `TPS`: Trades por segundo (throughput)
-- `Gaps`: Trades perdidos (gaps detectados)
-- `OOO`: Trades fora de ordem (out-of-order)
+**Erro ao conectar:**
+- Verifique conexão com internet
+- Verifique Security Group (porta 9443)
 
-## 📊 Variáveis de Ambiente
+**CSV não é criado:**
+- Verifique se `CSV_FILE` está configurado
+- Verifique permissões de escrita
 
-- `MACHINE_ID`: Identificador da máquina (obrigatório para comparação)
-- `CSV_FILE`: Arquivo CSV para salvar dados (opcional)
-- `MIN_TRADES`: Número mínimo de trades (0 = infinito, padrão: 0)
-- `REALTIME`: Mostrar estatísticas em tempo real (1 = sim, 0 = não, padrão: 1)
-- `STATS_SAMPLES`: Tamanho da amostra para cálculo de percentis (padrão: 10000)
+**Teste para antes de completar:**
+- Use `screen` ou `tmux` para sessões persistentes
+- Execute com `nohup` em background
 
-## 🧪 Teste em Múltiplas Instâncias AWS
+## 📝 Notas
 
-### Passo 1: Executar em cada instância
-
-**Instância 1 (m8a.xlarge):**
-```bash
-CSV_FILE=latency_m8a.csv MACHINE_ID=m8a.xlarge ./target/release/binance-trades
-```
-
-**Instância 2 (z1d.xlarge):**
-```bash
-CSV_FILE=latency_z1d.csv MACHINE_ID=z1d.xlarge ./target/release/binance-trades
-```
-
-**Instância 3 (c8i.xlarge):**
-```bash
-CSV_FILE=latency_c8i.csv MACHINE_ID=c8i.xlarge ./target/release/binance-trades
-```
-
-### Passo 2: Comparar resultados
-
-Baixe os CSVs e compare manualmente ou use ferramentas de análise:
-- Mesmos `trade_id` = mesmo trade
-- Compare `latency_ms` entre máquinas
-- Menor latência = melhor configuração
-
-## 📁 Formato do CSV
-
-```
-trade_id,ts,recv_ts,latency_ms,machine_id
-5827967018,1769693418802,1769693418944,142.00,m8a.xlarge
-```
-
-- `trade_id`: ID único do trade (para merge)
-- `ts`: Timestamp do trade (da Binance)
-- `recv_ts`: Timestamp de recebimento na máquina
-- `latency_ms`: Latência calculada (recv_ts - ts)
-- `machine_id`: Identificador da máquina
-
-## ⚙️ Otimizações de Rede (Opcional)
-
-Para aplicar otimizações de rede antes do teste:
-```bash
-bash optimize_network.sh
-```
-
-## 📈 Métricas e Validações
-
-### Estatísticas de Latência
-- **Avg**: Latência média
-- **p50 (Mediana)**: 50% dos trades têm latência ≤ este valor
-- **p95**: 95% dos trades têm latência ≤ este valor
-- **p99**: 99% dos trades têm latência ≤ este valor
-- **Min**: Latência mínima observada
-- **Max**: Latência máxima observada
-- **Jitter**: Desvio padrão (variação de latência) - menor é melhor
-
-### Validações de Integridade
-- **Gaps**: Número de trades perdidos (detecta quando `trade_id` pula números)
-- **Out-of-Order (OOO)**: Número de trades recebidos fora de ordem
-  - Trades devem chegar em ordem crescente de `trade_id`
-  - Se `trade_id` atual < `trade_id` anterior = fora de ordem
-
-### Métricas de Performance
-- **TPS (Trades Per Second)**: Throughput - quantos trades por segundo estão sendo processados
-- **Total de trades**: Contador total de trades coletados
-
-## 🔍 Como o Teste Funciona (Detalhado)
-
-### Fluxo de Processamento
-
-```
-1. WebSocket recebe mensagem JSON da Binance
-   ↓
-2. Captura timestamp de recebimento (recv_ts) - IMEDIATAMENTE
-   ↓
-3. Extrai trade_id e timestamp do trade (ts) - busca de string, sem parsing JSON
-   ↓
-4. Calcula latência: latency_ms = recv_ts - ts
-   ↓
-5. Atualiza estatísticas (lock-free com atomics)
-   ↓
-6. Salva no CSV (se habilitado)
-   ↓
-7. Mostra estatísticas em tempo real (a cada 1s)
-```
-
-### Por que é rápido?
-- **Zero parsing JSON**: Apenas busca strings `"t":` e `"T":` no texto (não deserializa JSON completo)
-- **Lock-free**: Usa atomics para estatísticas, sem locks ou spawn por trade
-- **Mínimo overhead**: Apenas extrai timestamp e calcula diferença
-
-### O que a latência mede?
-A latência `recv_ts - ts` inclui:
-- ✅ Tempo de rede (Binance → sua máquina)
-- ✅ Overhead do WebSocket/TCP
-- ✅ Processamento mínimo (extração de timestamp)
-
-**NÃO inclui**: Parsing JSON completo, logging, I/O de arquivo (se assíncrono)
-
-### Exemplo de Mensagem JSON
-```json
-{"e":"trade","E":1769693418944,"s":"BTCUSDT","t":5827967018,"p":"88120.26","q":"0.00008","T":1769693418802,"m":false}
-```
-- Campo `t`: trade_id (5827967018)
-- Campo `T`: timestamp do trade (1769693418802)
-- O código busca esses campos diretamente, sem deserializar o JSON completo
-
-## 🔍 Interpretando os Resultados
-
-### O que procurar em uma boa configuração?
-1. **Latência baixa**: p50, p95, p99 próximos da média
-2. **Jitter baixo**: Variação consistente (std dev < 10ms ideal)
-3. **Zero gaps**: Nenhum trade perdido
-4. **Zero OOO**: Trades chegam em ordem
-5. **TPS alto**: Capacidade de processar muitos trades/segundo
-
-### Comparando Instâncias
-- **Melhor latência**: Menor p50, p95, p99
-- **Mais consistente**: Menor jitter
-- **Mais confiável**: Zero gaps e zero OOO
-- **Mais performático**: Maior TPS
-
-## ✅ Verificando se Está Funcionando
-
-### Sinais de que está funcionando:
-1. ✅ **Conexão estabelecida**: Mensagem "Conectado!" aparece
-2. ✅ **Trades incrementando**: Número de trades aumenta continuamente
-3. ✅ **Latência realista**: Valores entre 50-300ms (depende da região)
-4. ✅ **TPS > 0**: Throughput mostra trades por segundo
-5. ✅ **Gaps = 0**: Idealmente nenhum trade perdido
-6. ✅ **Estatísticas finais**: Ao parar (Ctrl+C), mostra resumo completo
-
-### Problemas comuns:
-- ❌ **"Erro ao conectar"**: Verifique conexão com internet
-- ❌ **Latência negativa**: Problema de sincronização de relógio (raro)
-- ❌ **Gaps > 0**: Perda de mensagens (pode ser rede instável)
-- ❌ **TPS muito baixo**: Verifique se está usando `--release`
-
-## ⚠️ Importante
-
-- **Sempre use `--release`** para performance real
-- **Região próxima** (ap-southeast-1) terá menor latência
-- Execute simultaneamente em múltiplas máquinas para comparar os mesmos trades
-- Colete pelo menos 100k trades para estatísticas confiáveis
-- **Gaps > 0** indica perda de mensagens (problema de rede/WebSocket)
-- **OOO > 0** indica que trades chegam fora de ordem (pode ser normal em alta carga)
+- Estatísticas devem ser calculadas **após JOIN** por `trade_id`
+- Execute testes simultaneamente para comparar mesmos trades
+- Colete pelo menos 100k trades para análise estatística válida
+- Região AWS próxima aos servidores da Binance = menor latência

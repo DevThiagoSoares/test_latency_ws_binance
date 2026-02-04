@@ -1,27 +1,12 @@
 # Rust
 /target/
-**/*.rs.bk
-*.pdb
 Cargo.lock
 
 # CSV files (dados de teste)
 *.csv
-!test_data/*.csv
 
 # Logs
 *.log
-log.log
-
-# Python (se houver scripts Python)
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
-.venv
 
 # IDEs
 .idea/
@@ -29,31 +14,8 @@ ENV/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Arquivos temporários
 *.tmp
 *.bak
-*.backup
-*~
-
-# Arquivos de sistema
 .DS_Store
-Thumbs.db
-
-# Arquivos de teste específicos
-test_quick_*.csv
-latency_*.csv
-merged_results.csv
-
-# Arquivos de build
-*.o
-*.a
-*.dylib
-*.dll
-*.exe
-
-# Arquivos de configuração local
-.env
-.env.local
-

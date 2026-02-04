@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_test.sh - Executa teste de latência
+# run_test.sh - Executa teste de latência (funciona local e AWS)
 
 set -e
 
@@ -14,12 +14,16 @@ echo ""
 # Otimizações de rede (opcional)
 if [ "$OPTIMIZE_NETWORK" = "true" ]; then
     echo "Aplicando otimizações de rede..."
-    bash optimize_network.sh
+    sudo ./optimize_network.sh
     echo ""
 fi
 
-# Compila
-cargo build --release
+# Compila se necessário
+if [ ! -f "./target/release/binance-trades" ]; then
+    echo "Compilando..."
+    cargo build --release
+    echo ""
+fi
 
 # Executa
 CSV_FILE="latency_${INSTANCE_TYPE}_$(date +%s).csv"
