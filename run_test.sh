@@ -5,10 +5,13 @@ set -e
 
 INSTANCE_TYPE=${1:-"unknown"}
 OPTIMIZE_NETWORK=${2:-"false"}
-MIN_TRADES=${3:-"100000"}
+COUNT=${3:-"100000"}
+SYMBOL=${4:-"btcusdt"}
 
-echo "Teste de Latência - Binance Trades"
-echo "Instance: $INSTANCE_TYPE | Trades: $MIN_TRADES"
+echo "=== Teste de Latência - Binance Trades ==="
+echo "Instance: $INSTANCE_TYPE"
+echo "Symbol:   $SYMBOL"
+echo "Trades:   $COUNT"
 echo ""
 
 # Otimizações de rede (opcional)
@@ -29,10 +32,8 @@ fi
 CSV_FILE="latency_${INSTANCE_TYPE}_$(date +%s).csv"
 CSV_FILE="$CSV_FILE" \
 MACHINE_ID="$INSTANCE_TYPE" \
-MIN_TRADES="$MIN_TRADES" \
-REALTIME=0 \
-./target/release/binance-trades
+./target/release/binance-trades "$SYMBOL" "$COUNT"
 
 echo ""
-echo "Arquivo: $CSV_FILE"
+echo "✅ Arquivo gerado: $CSV_FILE"
 
